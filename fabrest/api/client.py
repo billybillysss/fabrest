@@ -1,14 +1,18 @@
 import requests
 import logging
 import time
-from typing import Any, Dict, List, Optional
-from .constant import LongRunningOperationStatus, JobStatus
-import json
+from typing import Any, Dict, List, Optional, cast
+
 import aiohttp
 import asyncio
+import json
+
+from .constant import JobStatus, LongRunningOperationStatus
+from ..errors import HttpError, LongRunningOperationError, ThrottledError
+from ..logger import get_logger, log_event
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class BaseClient:
@@ -32,12 +36,11 @@ class BaseClient:
         self.credential = credential
         self.kwargs = kwargs
 
+        cred_class = getattr(credential, "__class__", None)
+        cred_name = cred_class.__name__ if cred_class else ""
         if scopes:
             self._scopes = scopes
-        elif (
-            getattr(credential, "__class__", None).__name__
-            == "ResourceOwnerPasswordCredential"
-        ):
+        elif cred_name == "ResourceOwnerPasswordCredential":
             self._scopes = self.DEFAULT_SCOPES_ROPC
         else:
             self._scopes = self.DEFAULT_SCOPES_SPN
@@ -55,15 +58,17 @@ class BaseClient:
         self,
         payload: Dict[str, Any],
         context: str = "",
-        prefix: str = "",
-        suffix: str = "",
+        **fields: Any,
     ) -> str:
         """
         Parse error payload and log a structured message.
         Assumes payload is already a dict parsed from JSON.
         """
-        code = payload.get("errorCode", "<no errorCode>")
-        msg = payload.get("message", "<no message>")
+        if isinstance(payload.get("error"), dict):
+            payload = payload["error"]
+
+        code = payload.get("errorCode") or payload.get("code") or "<no errorCode>"
+        msg = payload.get("message") or payload.get("errorMessage") or "<no message>"
         related = payload.get("relatedResource") or {}
         if related and isinstance(related, dict):
             related_str = ", ".join(f"{k}={v}" for k, v in related.items())
@@ -86,22 +91,35 @@ class BaseClient:
             detail_parts.append(f"[{idx}] {d_code}: {d_msg}{rel_part}")
         details_str = "; ".join(detail_parts)
 
-        parts = []
-        if context:
-            parts.append(f"[{context}]")
-        if prefix:
-            parts.append(prefix)
-        parts.append(f"{code}: {msg}")
-        if related:
-            parts.append(f"RelatedResource: {related}")
-        if details_str:
-            parts.append(f"MoreDetails: {details_str}")
-        if suffix:
-            parts.append(suffix)
+        log_event(
+            logger,
+            "api_error",
+            code=code,
+            message=msg,
+            context=context or None,
+            related=related or None,
+            details=details_str or None,
+            **fields,
+        )
 
-        log_msg = ". ".join(parts)
-        logger.error(log_msg)
+        log_msg = f"{code}: {msg}"
+        if related:
+            log_msg += f". RelatedResource: {related}"
+        if details_str:
+            log_msg += f". MoreDetails: {details_str}"
         return log_msg
+
+    def _raise_http_error(
+        self,
+        status_code: int,
+        payload: Dict[str, Any],
+        message: Optional[str] = None,
+    ) -> None:
+        if message is None:
+            message = self._error_response_handler(payload)
+        if status_code == 429:
+            raise ThrottledError(status_code, message, payload)
+        raise HttpError(status_code, message, payload)
 
 
 class Client(BaseClient):
@@ -128,9 +146,9 @@ class Client(BaseClient):
     def _throttling_handler(
         self,
         response: requests.Response,
-        headers: dict,
+        headers: Dict[str, str],
         session: requests.Session,
-        payload: dict,
+        request_payload: Optional[Dict[str, Any]],
         interval: Optional[int] = None,
         timeout: int = 120,
     ) -> requests.Response:
@@ -145,22 +163,30 @@ class Client(BaseClient):
                 data = {}
             self._error_response_handler(
                 data,
-                prefix="Throttled.",
-                suffix=f"Retry in {wait}s",
+                context="throttled",
+                retry_in=wait,
             )
             time.sleep(wait)
             req = response.request
+            if not req or req.method is None or req.url is None:
+                raise RuntimeError("Response request metadata missing for retry.")
             try:
+                method = cast(str, req.method)
+                url = cast(str, req.url)
                 response = session.request(
-                    req.method,
-                    req.url,
+                    method,
+                    url,
                     headers=self.get_headers(headers),
-                    json=payload,
+                    json=request_payload,
                     timeout=timeout,
                 )
             except requests.Timeout:
-                logger.error(
-                    f"Throttling handler timed out after {timeout}s: {req.method} {req.url}"
+                log_event(
+                    logger,
+                    "throttling_timeout",
+                    timeout=timeout,
+                    method=req.method,
+                    url=req.url,
                 )
                 raise
             if response.status_code != 429:
@@ -186,8 +212,11 @@ class Client(BaseClient):
                     continue_url, headers=self.get_headers(headers), timeout=timeout
                 )
             except requests.Timeout:
-                logger.error(
-                    f"Pagination handler timed out after {timeout}s: {continue_url}"
+                log_event(
+                    logger,
+                    "pagination_timeout",
+                    timeout=timeout,
+                    url=continue_url,
                 )
                 raise
             page = resp.json()
@@ -201,7 +230,7 @@ class Client(BaseClient):
     def _item_name_in_use_handler(
         self,
         response: requests.Response,
-        headers: dict,
+        headers: Dict[str, str],
         session: requests.Session,
         max_retries: int = 6,
         retry_interval: int = 60,
@@ -210,9 +239,12 @@ class Client(BaseClient):
         """Retry if item name conflict occurs."""
         if max_retries == 0 or not max_retries:
             return response
+        resp: Optional[requests.Response] = None
         for attempt in range(1, max_retries + 1):
             time.sleep(retry_interval)
             req = response.request
+            if not req or req.method is None or req.url is None:
+                raise RuntimeError("Response request metadata missing for retry.")
             try:
                 resp = session.request(
                     req.method,
@@ -222,8 +254,12 @@ class Client(BaseClient):
                     timeout=timeout,
                 )
             except requests.Timeout:
-                logger.error(
-                    f"Item name in use handler timed out after {timeout}s: {req.method} {req.url}"
+                log_event(
+                    logger,
+                    "item_name_in_use_timeout",
+                    timeout=timeout,
+                    method=req.method,
+                    url=req.url,
                 )
                 raise
             if not (
@@ -237,8 +273,14 @@ class Client(BaseClient):
             except Exception:
                 err_payload = {}
             self._error_response_handler(
-                err_payload, suffix=f"Retry after {retry_interval}s - {attempt}/{max_retries}"
+                err_payload,
+                context="item_name_in_use",
+                retry_after=retry_interval,
+                attempt=attempt,
+                max_retries=max_retries,
             )
+        if resp is None:
+            raise RuntimeError("No response received while retrying item name conflict.")
         resp.raise_for_status()
         return resp
 
@@ -255,12 +297,20 @@ class Client(BaseClient):
             response.headers.get("Retry-After", self.DEFAULT_LRO_INTERVAL)
         )
         url = response.headers.get("Location")
-        logger.info(f"Long Running Operation started, checking in {wait}s at {url}")
+        if not url:
+            raise RuntimeError("LRO response missing Location header.")
+        url = cast(str, url)
+        log_event(
+            logger,
+            "lro_started",
+            wait=wait,
+            url=url,
+        )
         time.sleep(wait)
 
         terminate_codes = {
-            LongRunningOperationStatus.FAILED.value,
-            LongRunningOperationStatus.UNDEFINED.value,
+            LongRunningOperationStatus.FAILED,
+            LongRunningOperationStatus.UNDEFINED,
         }
         while True:
             try:
@@ -268,7 +318,12 @@ class Client(BaseClient):
                     url, headers=self.get_headers(headers), timeout=timeout
                 )
             except requests.Timeout:
-                logger.error(f"LRO handler timed out after {timeout}s: {url}")
+                log_event(
+                    logger,
+                    "lro_timeout",
+                    timeout=timeout,
+                    url=url,
+                )
                 raise
             if resp.status_code >= 300:
                 return resp
@@ -282,38 +337,60 @@ class Client(BaseClient):
                 error = data.get("error", {})
                 msg = self._error_response_handler(
                     error,
-                    prefix="Long running operation error. ",
-                    suffix=f"URL: {url}",
+                    context="lro",
+                    url=url,
                 )
-                raise Exception(msg)
-            logger.info(
-                f"Long Running Operation: {status}, progress {data.get('percentComplete')}%. Checking in {wait}s at {url}"
+                raise LongRunningOperationError(500, msg, error)
+            log_event(
+                logger,
+                "lro_status",
+                status=status,
+                percent_complete=data.get("percentComplete"),
+                wait=wait,
+                url=url,
             )
             if url.endswith("results"):
                 break
             time.sleep(wait)
             url = resp.headers.get("Location")
+            if not url:
+                raise RuntimeError("LRO response missing Location header.")
+            url = cast(str, url)
 
         try:
             final_resp = session.get(
                 url, headers=self.get_headers(headers), timeout=timeout
             )
         except requests.Timeout:
-            logger.error(f"LRO handler final get timed out after {timeout}s: {url}")
+            log_event(
+                logger,
+                "lro_final_timeout",
+                timeout=timeout,
+                url=url,
+            )
             raise
         return final_resp
 
     def _job_run_handler(
         self,
         response: requests.Response,
-        headers: dict,
+        headers: Dict[str, str],
         session: requests.Session,
-        interval: int,
+        interval: Optional[int],
         timeout: int = 120,
     ) -> requests.Response:
-        wait = int(response.headers.get("Retry-After", interval))
+        fallback_interval = interval or self.DEFAULT_LRO_INTERVAL
+        wait = int(response.headers.get("Retry-After", fallback_interval))
         url = response.headers.get("Location")
-        logger.info(f"Job started, checking in {wait}s at {url}")
+        if not url:
+            raise RuntimeError("Job response missing Location header.")
+        url = cast(str, url)
+        log_event(
+            logger,
+            "job_started",
+            wait=wait,
+            url=url,
+        )
         time.sleep(wait)
         while True:
             try:
@@ -321,25 +398,36 @@ class Client(BaseClient):
                     url, headers=self.get_headers(headers), timeout=timeout
                 )
             except requests.Timeout:
-                logger.error(f"Job run handler timed out after {timeout}s: {url}")
+                log_event(
+                    logger,
+                    "job_timeout",
+                    timeout=timeout,
+                    url=url,
+                )
                 raise
             if resp.status_code >= 300:
                 return resp
-            wait = int(resp.headers.get("Retry-After", interval))
+            wait = int(resp.headers.get("Retry-After", fallback_interval))
             data = resp.json()
             status = data.get("status")
-            if status in {JobStatus.FAILED.value, JobStatus.DEDUPE.value}:
+            if status in {JobStatus.FAILED, JobStatus.DEDUPE}:
                 error = data.get("failureReason", {})
                 msg = self._error_response_handler(
                     error,
-                    prefix="Job terminated. ",
-                    suffix=f"URL: {url}",
+                    context="job",
+                    url=url,
                 )
                 raise Exception(msg)
-            elif status in {JobStatus.COMPLETED.value, JobStatus.CANCELLED.value}:
+            elif status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
                 return resp
 
-            logger.info(f"Job status: {status}. Checking in {wait}s at {url}")
+            log_event(
+                logger,
+                "job_status",
+                status=status,
+                wait=wait,
+                url=url,
+            )
             time.sleep(wait)
 
     def _send_request(
@@ -365,17 +453,25 @@ class Client(BaseClient):
     ) -> requests.Response:
         """Generic retry/error handler for both normal and job requests."""
         session = self._get_or_create_session(session)
+        merged_headers: Dict[str, str] = headers or {}
+        resp: Optional[requests.Response] = None
         try:
             resp = session.request(
                 method=method,
                 url=url,
-                headers=self.get_headers(headers),
+                headers=self.get_headers(merged_headers),
                 params=params,
                 json=json,
                 timeout=timeout,
             )
         except requests.Timeout:
-            logger.error(f"Request timed out after {timeout}s: {method} {url}")
+            log_event(
+                logger,
+                "request_timeout",
+                timeout=timeout,
+                method=method,
+                url=url,
+            )
             raise
 
         retries = 0
@@ -385,9 +481,9 @@ class Client(BaseClient):
                 if code == 429:
                     resp = self._throttling_handler(
                         resp,
-                        headers,
+                        merged_headers,
                         session,
-                        payload=json,
+                        request_payload=json,
                         interval=throttle_retry_interval,
                         timeout=timeout,
                     )
@@ -402,15 +498,14 @@ class Client(BaseClient):
                     except Exception:
                         used_name_payload = {}
 
-                    if item_name_in_use_max_retries > 0:
-                        used_name_log_suffix = f"Retry after {item_name_in_use_retry_interval}s"
-                    else:
-                        used_name_log_suffix = ""
-
-                    self._error_response_handler(used_name_payload, suffix=used_name_log_suffix)
+                    self._error_response_handler(
+                        used_name_payload,
+                        context="item_name_in_use",
+                        retry_after=item_name_in_use_retry_interval,
+                    )
                     resp = self._item_name_in_use_handler(
                         resp,
-                        headers,
+                        merged_headers,
                         session,
                         max_retries=item_name_in_use_max_retries,
                         retry_interval=item_name_in_use_retry_interval,
@@ -421,7 +516,7 @@ class Client(BaseClient):
                     if handle_long_running_operation:
                         resp = self._lro_handler(
                             resp,
-                            headers,
+                            merged_headers,
                             session,
                             interval=lro_check_interval,
                             timeout=timeout,
@@ -429,7 +524,7 @@ class Client(BaseClient):
                     elif handle_long_running_job:
                         resp = self._job_run_handler(
                             resp,
-                            headers,
+                            merged_headers,
                             session,
                             interval=job_check_interval,
                             timeout=timeout,
@@ -438,7 +533,7 @@ class Client(BaseClient):
                 if 200 <= resp.status_code < 300:
                     if handle_pagination:
                         resp = self._pagination_handler(
-                            resp, headers, session, timeout=timeout
+                            resp, merged_headers, session, timeout=timeout
                         )
                     return resp
                 # If not successful, log and possibly raise
@@ -446,8 +541,7 @@ class Client(BaseClient):
                     payload = resp.json()
                 except Exception:
                     payload = {}
-                self._error_response_handler(payload)
-                resp.raise_for_status()
+                self._raise_http_error(resp.status_code, payload)
 
             except Exception as e:
                 retries += 1
@@ -496,7 +590,7 @@ class Client(BaseClient):
             handle_pagination=True,
         )
 
-    def job_request(
+    def _invoke(
         self,
         url: str,
         headers: Optional[Dict[str, str]] = None,
@@ -506,7 +600,7 @@ class Client(BaseClient):
         timeout: int = 120,
         wait_for_completion: bool = True,
         throttle_retry_interval: Optional[int] = None,
-        job_check_interval: Optional[int] = None,
+        invoke_check_interval: Optional[int] = None,
         max_retries: int = 0,
         retry_interval: int = 5,
     ):
@@ -521,7 +615,7 @@ class Client(BaseClient):
             timeout=timeout,
             wait_for_completion=wait_for_completion,
             throttle_retry_interval=throttle_retry_interval,
-            job_check_interval=job_check_interval,
+            job_check_interval=invoke_check_interval,
             max_retries=max_retries,
             retry_interval=retry_interval,
             handle_long_running_job=True,
@@ -564,8 +658,8 @@ class AsyncClient(BaseClient):
     async def _throttling_handler(
         self,
         response: aiohttp.ClientResponse,
-        headers: dict,
-        payload: dict,
+        headers: Dict[str, str],
+        request_payload: Optional[Dict[str, Any]],
         interval: Optional[int] = None,
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
@@ -578,30 +672,38 @@ class AsyncClient(BaseClient):
             except Exception:
                 err_payload = {}
             self._error_response_handler(
-                err_payload, prefix="Throttled.", suffix=f"Retry in {wait}s"
+                err_payload,
+                context="throttled",
+                retry_in=wait,
             )
             await asyncio.sleep(wait)
             req = response.request_info
+            if req is None or req.method is None or req.url is None:
+                raise RuntimeError("Response request metadata missing for retry.")
             session = await self._get_or_create_session()
             try:
                 async with asyncio.timeout(timeout):
                     async with session.request(
-                        req.method,
+                        cast(str, req.method),
                         req.url,
                         headers=self.get_headers(headers),
-                        json=payload,
+                        json=request_payload,
                     ) as resp:
                         if resp.status != 429:
                             return resp
                         response = resp  # Keep retrying if 429
             except asyncio.TimeoutError:
-                logger.error(f"Throttling handler timed out after {timeout}s")
+                log_event(
+                    logger,
+                    "throttling_timeout",
+                    timeout=timeout,
+                )
                 raise
 
     async def _pagination_handler(
         self,
         response: aiohttp.ClientResponse,
-        headers: dict,
+        headers: Dict[str, str],
         session: aiohttp.ClientSession,
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
@@ -623,7 +725,11 @@ class AsyncClient(BaseClient):
                         items.extend(page.get("value", []))
                         continue_url = page.get("continuationUri")
             except asyncio.TimeoutError:
-                logger.error(f"Pagination handler timed out after {timeout}s")
+                log_event(
+                    logger,
+                    "pagination_timeout",
+                    timeout=timeout,
+                )
                 raise
 
         data["value"] = items
@@ -633,7 +739,7 @@ class AsyncClient(BaseClient):
     async def _item_name_in_use_handler(
         self,
         response: aiohttp.ClientResponse,
-        headers: dict,
+        headers: Dict[str, str],
         session: aiohttp.ClientSession,
         max_retries: int = 6,
         retry_interval: int = 60,
@@ -643,6 +749,7 @@ class AsyncClient(BaseClient):
             return response
         req = response.request_info
         body = await response.read()
+        resp: Optional[aiohttp.ClientResponse] = None
         for attempt in range(1, max_retries + 1):
             await asyncio.sleep(retry_interval)
             try:
@@ -652,30 +759,40 @@ class AsyncClient(BaseClient):
                         req.url,
                         headers=self.get_headers(headers),
                         data=body,
-                    ) as resp:
+                    ) as retry_resp:
                         if not (
-                            resp.status == 400
-                            and resp.headers.get("x-ms-public-api-error-code")
+                            retry_resp.status == 400
+                            and retry_resp.headers.get("x-ms-public-api-error-code")
                             == "ItemDisplayNameAlreadyInUse"
                         ):
-                            return resp
+                            return retry_resp
                         try:
-                            payload = await resp.json()
+                            payload = await retry_resp.json()
                         except Exception:
                             payload = {}
                         self._error_response_handler(
-                            payload, suffix=f"Retry after {retry_interval}s - {attempt}/{max_retries}"
+                            payload,
+                            context="item_name_in_use",
+                            retry_after=retry_interval,
+                            attempt=attempt,
+                            max_retries=max_retries,
                         )
             except asyncio.TimeoutError:
-                logger.error(f"Item name in use handler timed out after {timeout}s")
+                log_event(
+                    logger,
+                    "item_name_in_use_timeout",
+                    timeout=timeout,
+                )
                 raise
+        if resp is None:
+            raise RuntimeError("No response received while retrying item name conflict.")
         resp.raise_for_status()
         return resp
 
     async def _lro_handler(
         self,
         response: aiohttp.ClientResponse,
-        headers: dict,
+        headers: Dict[str, str],
         interval: Optional[int] = None,
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
@@ -683,6 +800,9 @@ class AsyncClient(BaseClient):
             response.headers.get("Retry-After", self.DEFAULT_LRO_INTERVAL)
         )
         url = response.headers.get("Location")
+        if not url:
+            raise RuntimeError("LRO response missing Location header.")
+        url = cast(str, url)
         logger.info(f"Long Running Operation started, checking in {wait}s at {url}")
         await asyncio.sleep(wait)
 
@@ -691,35 +811,47 @@ class AsyncClient(BaseClient):
         while True:
             try:
                 async with asyncio.timeout(timeout):
+                    current_url = cast(str, url)
                     async with session.get(
-                        url, headers=self.get_headers(headers)
+                        current_url, headers=self.get_headers(headers)
                     ) as resp:
                         if resp.status >= 300:
                             return resp
                         data = await resp.json()
                         status = data.get("status")
                         if status in {
-                            LongRunningOperationStatus.FAILED.value,
-                            LongRunningOperationStatus.UNDEFINED.value,
+                            LongRunningOperationStatus.FAILED,
+                            LongRunningOperationStatus.UNDEFINED,
                         }:
+                            error = data.get("error", {})
                             msg = self._error_response_handler(
-                                data.get("error", {}),
-                                prefix="Long running operation error. ",
-                                suffix=f"URL: {url}",
+                                error,
+                                context="lro",
+                                url=url,
                             )
-                            raise Exception(msg)
+                            raise LongRunningOperationError(500, msg, error)
 
-                        logger.info(
-                            f"Long Running Operation: {status}, progress {data.get('percentComplete')}%"
+                        log_event(
+                            logger,
+                            "lro_status",
+                            status=status,
+                            percent_complete=data.get("percentComplete"),
                         )
 
-                        if url.endswith("results"):
+                        if current_url.endswith("results"):
                             break
 
                         await asyncio.sleep(wait)
                         url = resp.headers.get("Location")
+                        if not url:
+                            raise RuntimeError("LRO response missing Location header.")
+                        url = cast(str, url)
             except asyncio.TimeoutError:
-                logger.error(f"LRO handler timed out after {timeout}s")
+                log_event(
+                    logger,
+                    "lro_timeout",
+                    timeout=timeout,
+                )
                 raise
 
         try:
@@ -727,20 +859,33 @@ class AsyncClient(BaseClient):
                 async with session.get(url, headers=self.get_headers(headers)) as resp:
                     return resp
         except asyncio.TimeoutError:
-            logger.error(f"LRO handler final get timed out after {timeout}s")
+            log_event(
+                logger,
+                "lro_final_timeout",
+                timeout=timeout,
+            )
             raise
 
     async def _job_run_handler(
         self,
         response: aiohttp.ClientResponse,
-        headers: dict,
+        headers: Dict[str, str],
         session: aiohttp.ClientSession,
-        interval: int,
+        interval: Optional[int],
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
-        wait = int(response.headers.get("Retry-After", interval))
+        fallback_interval = interval or self.DEFAULT_LRO_INTERVAL
+        wait = int(response.headers.get("Retry-After", fallback_interval))
         url = response.headers.get("Location")
-        logger.info(f"Job started, checking in {wait}s at {url}")
+        if not url:
+            raise RuntimeError("Job response missing Location header.")
+        url = cast(str, url)
+        log_event(
+            logger,
+            "job_started",
+            wait=wait,
+            url=url,
+        )
         await asyncio.sleep(wait)
         while True:
             try:
@@ -750,24 +895,35 @@ class AsyncClient(BaseClient):
                         return resp
                     data = await resp.json()
                     status = data.get("status")
-                    if status in {JobStatus.FAILED.value, JobStatus.DEDUPE.value}:
+                    if status in {JobStatus.FAILED, JobStatus.DEDUPE}:
                         error = data.get("failureReason", {})
                         msg = self._error_response_handler(
                             error,
-                            prefix="Job terminated. ",
-                            suffix=f"URL: {url}",
+                            context="job",
+                            url=url,
                         )
                         raise Exception(msg)
                     elif status in {
-                        JobStatus.COMPLETED.value,
-                        JobStatus.CANCELLED.value,
+                        JobStatus.COMPLETED,
+                        JobStatus.CANCELLED,
                     }:
                         return resp
 
-                    logger.info(f"Job status: {status}. Checking in {wait}s at {url}")
+                    log_event(
+                        logger,
+                        "job_status",
+                        status=status,
+                        wait=wait,
+                        url=url,
+                    )
                     await asyncio.sleep(wait)
             except asyncio.TimeoutError:
-                logger.error(f"Job run handler timed out after {timeout}s")
+                log_event(
+                    logger,
+                    "job_timeout",
+                    timeout=timeout,
+                    url=url,
+                )
                 raise
 
     async def _send_request(
@@ -793,6 +949,8 @@ class AsyncClient(BaseClient):
     ) -> aiohttp.ClientResponse:
         """Generic retry/error handler for both normal and job requests."""
         session = await self._get_or_create_session(session)
+        merged_headers: Dict[str, str] = headers or {}
+        resp: Optional[aiohttp.ClientResponse] = None
         retries = 0
         while retries <= max_retries:
             try:
@@ -801,21 +959,29 @@ class AsyncClient(BaseClient):
                         resp = await session.request(
                             method=method,
                             url=url,
-                            headers=self.get_headers(headers),
+                            headers=self.get_headers(merged_headers),
                             params=params,
                             json=json,
                         )
                 except asyncio.TimeoutError:
-                    logger.error(f"Request timed out after {timeout}s: {method} {url}")
+                    log_event(
+                        logger,
+                        "request_timeout",
+                        timeout=timeout,
+                        method=method,
+                        url=url,
+                    )
                     raise
+
+                if resp is None:
+                    raise RuntimeError("No response received.")
 
                 code = resp.status
                 if code == 429:
                     resp = await self._throttling_handler(
                         resp,
-                        headers,
-                        session,
-                        payload=json,
+                        merged_headers,
+                        request_payload=json,
                         interval=throttle_retry_interval,
                         timeout=timeout,
                     )
@@ -830,15 +996,14 @@ class AsyncClient(BaseClient):
                     except Exception:
                         used_name_payload = {}
                         
-                    if item_name_in_use_max_retries > 0:
-                        used_name_log_suffix = f"Retry after {item_name_in_use_retry_interval}s"
-                    else:
-                        used_name_log_suffix = ""
-
-                    self._error_response_handler(used_name_payload, suffix=used_name_log_suffix)
+                    self._error_response_handler(
+                        used_name_payload,
+                        context="item_name_in_use",
+                        retry_after=item_name_in_use_retry_interval,
+                    )
                     resp = await self._item_name_in_use_handler(
                         resp,
-                        headers,
+                        merged_headers,
                         session,
                         max_retries=item_name_in_use_max_retries,
                         retry_interval=item_name_in_use_retry_interval,
@@ -848,12 +1013,12 @@ class AsyncClient(BaseClient):
                 elif code == 202 and wait_for_completion:
                     if handle_long_running_operation:
                         resp = await self._lro_handler(
-                            resp, headers, interval=lro_check_interval, timeout=timeout
+                            resp, merged_headers, interval=lro_check_interval, timeout=timeout
                         )
                     elif handle_long_running_job:
                         resp = await self._job_run_handler(
                             resp,
-                            headers,
+                            merged_headers,
                             session,
                             interval=job_check_interval,
                             timeout=timeout,
@@ -862,7 +1027,7 @@ class AsyncClient(BaseClient):
                 if 200 <= resp.status < 300:
                     if handle_pagination:
                         resp = await self._pagination_handler(
-                            resp, headers, session, timeout=timeout
+                            resp, merged_headers, session, timeout=timeout
                         )
                     return resp
 
@@ -871,8 +1036,7 @@ class AsyncClient(BaseClient):
                     payload = await resp.json()
                 except Exception:
                     payload = {}
-                self._error_response_handler(payload)
-                resp.raise_for_status()
+                self._raise_http_error(resp.status, payload)
 
             except Exception as e:
                 retries += 1
@@ -882,6 +1046,8 @@ class AsyncClient(BaseClient):
                 logger.info(
                     f"Request failed. Retrying after {retry_interval}s. {retries}/{max_retries}"
                 )
+        if resp is None:
+            raise RuntimeError("No response received.")
         return resp
 
     async def request(
@@ -921,7 +1087,7 @@ class AsyncClient(BaseClient):
             handle_pagination=True,
         )
 
-    async def job_request(
+    async def _invoke(
         self,
         url: str,
         headers: Optional[Dict[str, str]] = None,
@@ -931,7 +1097,7 @@ class AsyncClient(BaseClient):
         timeout: int = 120,
         wait_for_completion: bool = True,
         throttle_retry_interval: Optional[int] = None,
-        job_check_interval: Optional[int] = None,
+        invoke: Optional[int] = None,
         max_retries: int = 0,
         retry_interval: int = 5,
     ):
@@ -946,7 +1112,7 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             wait_for_completion=wait_for_completion,
             throttle_retry_interval=throttle_retry_interval,
-            job_check_interval=job_check_interval,
+            job_check_interval=invoke,
             max_retries=max_retries,
             retry_interval=retry_interval,
             handle_long_running_job=True,
