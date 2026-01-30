@@ -1,14 +1,6 @@
-from .constants.collections import (
-    ADMIN_COLLECTIONS,
-    COLLECTIONS,
-    GIT_OPERATIONS,
-    WORKSPACE_OPERATIONS,
-    AdminCollection,
-    Collection,
-    GitOperation,
-    WorkspaceOperation,
-)
-from .constants.items import (
+from .collections import ADMIN_COLLECTIONS, COLLECTIONS, AdminCollection, Collection
+from .collections import GIT_OPERATIONS, WORKSPACE_OPERATIONS, GitOperation, WorkspaceOperation
+from .items import (
     EXTERNAL_DATA_SHARE_OPERATIONS,
     ITEM_COLLECTIONS,
     ITEM_TYPES,
@@ -19,7 +11,7 @@ from .constants.items import (
     ItemTypeLiteral,
     TagOperation,
 )
-from .constants.jobs import (
+from .jobs import (
     JOB_COLLECTIONS,
     JOB_STATUSES,
     JOB_TYPES,
@@ -30,7 +22,7 @@ from .constants.jobs import (
     JobTypeLiteral,
     LongRunningOperationStatus,
 )
-from .constants.specialized import (
+from .specialized import (
     ENVIRONMENT_COLLECTIONS,
     LAKEHOUSE_COLLECTIONS,
     SPARK_OPERATIONS,
@@ -38,11 +30,9 @@ from .constants.specialized import (
     LakehouseCollection,
     SparkOperation,
 )
-from .constants.utils import coerce_value
-from .constants.workspace_collection import WORKSPACE_COLLECTIONS, coerce_workspace_collection
-from .constants.workspace_config import WORKSPACE_CONFIG, WorkspaceConfigType, WorkspaceConfigTypeLiteral
-
-WorksapceOperation = WorkspaceOperation
+from .utils import coerce_value
+from .workspace_collection import WORKSPACE_COLLECTIONS, coerce_workspace_collection
+from .workspace_config import WORKSPACE_CONFIG, WorkspaceConfigType, WorkspaceConfigTypeLiteral
 
 __all__ = [
     "ADMIN_COLLECTIONS",
@@ -81,7 +71,6 @@ __all__ = [
     "WorkspaceConfigType",
     "WorkspaceConfigTypeLiteral",
     "WorkspaceOperation",
-    "WorksapceOperation",
     "coerce_value",
     "coerce_workspace_collection",
 ]

@@ -1,6 +1,6 @@
 [project]
 name = "fabrest"
-version = "0.1.0"
+version = "1.0.0"
 description = "A Python Fabric Rest Client to make requests to the Fabric API"
 readme = "README.md"
 requires-python = ">=3.11"
