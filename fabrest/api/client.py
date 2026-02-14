@@ -392,6 +392,8 @@ class Client(BaseClient):
                     url = cast(str, next_url)
                 elif state_url:
                     url = f"{state_url}/result"
+                elif not (url.endswith("/result") or url.endswith("results")):
+                    url = f"{url}/result"
                 break
             if url.endswith("results") or url.endswith("/result"):
                 break
@@ -921,6 +923,11 @@ class AsyncClient(BaseClient):
                                 url = cast(str, next_url)
                             elif state_url:
                                 url = f"{state_url}/result"
+                            elif not (
+                                current_url.endswith("/result")
+                                or current_url.endswith("results")
+                            ):
+                                url = f"{current_url}/result"
                             break
                         if current_url.endswith("results") or current_url.endswith(
                             "/result"
