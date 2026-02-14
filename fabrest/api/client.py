@@ -388,7 +388,6 @@ class Client(BaseClient):
                     "lro_status",
                     status=status,
                     percent_complete=data.get("percentComplete"),
-                    wait=0,
                     url=url,
                 )
                 break
@@ -930,7 +929,6 @@ class AsyncClient(BaseClient):
                                 "lro_status",
                                 status=status,
                                 percent_complete=data.get("percentComplete"),
-                                wait=0,
                                 url=url,
                             )
                             break
