@@ -386,6 +386,13 @@ class Client(BaseClient):
                 wait=wait,
                 url=url,
             )
+            if status == LongRunningOperationStatus.SUCCEEDED:
+                next_url = resp.headers.get("Location")
+                if next_url:
+                    url = cast(str, next_url)
+                elif state_url:
+                    url = f"{state_url}/result"
+                break
             if url.endswith("results") or url.endswith("/result"):
                 break
             time.sleep(wait)
@@ -908,6 +915,13 @@ class AsyncClient(BaseClient):
                             percent_complete=data.get("percentComplete"),
                         )
 
+                        if status == LongRunningOperationStatus.SUCCEEDED:
+                            next_url = resp.headers.get("Location")
+                            if next_url:
+                                url = cast(str, next_url)
+                            elif state_url:
+                                url = f"{state_url}/result"
+                            break
                         if current_url.endswith("results") or current_url.endswith(
                             "/result"
                         ):
