@@ -1,7 +1,7 @@
 import requests
 import logging
 import time
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 import aiohttp
 import asyncio
@@ -10,6 +10,7 @@ import json
 from .constant import JobStatus, LongRunningOperationStatus
 from ..errors import HttpError, LongRunningOperationError, ThrottledError
 from ..logger import get_logger, log_event
+from ..routes import ENDPOINT
 
 
 logger = get_logger(__name__)
@@ -121,6 +122,28 @@ class BaseClient:
             raise ThrottledError(status_code, message, payload)
         raise HttpError(status_code, message, payload)
 
+    def _get_retry_wait(
+        self,
+        headers: Optional[Mapping[str, str]],
+        backoff_seconds: int,
+        fallback_seconds: int,
+    ) -> int:
+        wait = backoff_seconds if backoff_seconds > 0 else fallback_seconds
+        if headers is None:
+            return wait
+        retry_after = headers.get("Retry-After")
+        if retry_after is None:
+            return wait
+        try:
+            retry_after_int = int(retry_after)
+        except (TypeError, ValueError):
+            return wait
+        if retry_after_int <= 0:
+            return wait
+        if wait > retry_after_int:
+            return retry_after_int
+        return wait
+
 
 class Client(BaseClient):
     """Synchronous Client for Microsoft Fabric REST API."""
@@ -153,9 +176,10 @@ class Client(BaseClient):
         timeout: int = 120,
     ) -> requests.Response:
         """Handle 429 responses by waiting and retrying."""
+        backoff_seconds = interval if interval is not None else 2
         while True:
-            wait = interval or int(
-                response.headers.get("Retry-After", self.DEFAULT_THROTTLE_INTERVAL)
+            wait = self._get_retry_wait(
+                response.headers, backoff_seconds, self.DEFAULT_THROTTLE_INTERVAL
             )
             try:
                 data = response.json()
@@ -167,6 +191,7 @@ class Client(BaseClient):
                 retry_in=wait,
             )
             time.sleep(wait)
+            backoff_seconds *= 2
             req = response.request
             if not req or req.method is None or req.url is None:
                 raise RuntimeError("Response request metadata missing for retry.")
@@ -240,8 +265,11 @@ class Client(BaseClient):
         if max_retries == 0 or not max_retries:
             return response
         resp: Optional[requests.Response] = None
+        backoff_seconds = 2
         for attempt in range(1, max_retries + 1):
-            time.sleep(retry_interval)
+            wait = self._get_retry_wait(None, backoff_seconds, retry_interval)
+            time.sleep(wait)
+            backoff_seconds *= 2
             req = response.request
             if not req or req.method is None or req.url is None:
                 raise RuntimeError("Response request metadata missing for retry.")
@@ -275,7 +303,7 @@ class Client(BaseClient):
             self._error_response_handler(
                 err_payload,
                 context="item_name_in_use",
-                retry_after=retry_interval,
+                retry_after=wait,
                 attempt=attempt,
                 max_retries=max_retries,
             )
@@ -293,13 +321,21 @@ class Client(BaseClient):
         timeout: int = 120,
     ) -> requests.Response:
         """Poll long-running operations until completion."""
-        wait = interval or int(
-            response.headers.get("Retry-After", self.DEFAULT_LRO_INTERVAL)
-        )
+        backoff_seconds = interval if interval is not None else 2
+        wait = self._get_retry_wait(response.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL)
+        operation_id = response.headers.get("x-ms-operation-id")
+        state_url = None
         url = response.headers.get("Location")
+        if not url and operation_id:
+            state_url = f"{ENDPOINT}/operations/{operation_id}"
+            url = state_url
         if not url:
-            raise RuntimeError("LRO response missing Location header.")
+            raise RuntimeError(
+                "LRO response missing Location header and x-ms-operation-id."
+            )
         url = cast(str, url)
+        if operation_id and not state_url:
+            state_url = f"{ENDPOINT}/operations/{operation_id}"
         log_event(
             logger,
             "lro_started",
@@ -307,6 +343,7 @@ class Client(BaseClient):
             url=url,
         )
         time.sleep(wait)
+        backoff_seconds *= 2
 
         terminate_codes = {
             LongRunningOperationStatus.FAILED,
@@ -328,9 +365,6 @@ class Client(BaseClient):
             if resp.status_code >= 300:
                 return resp
 
-            wait = int(
-                resp.headers.get("Retry-After", interval or self.DEFAULT_LRO_INTERVAL)
-            )
             data = resp.json()
             status = data.get("status")
             if status in terminate_codes:
@@ -341,6 +375,9 @@ class Client(BaseClient):
                     url=url,
                 )
                 raise LongRunningOperationError(500, msg, error)
+            wait = self._get_retry_wait(
+                resp.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL
+            )
             log_event(
                 logger,
                 "lro_status",
@@ -349,13 +386,23 @@ class Client(BaseClient):
                 wait=wait,
                 url=url,
             )
-            if url.endswith("results"):
+            if url.endswith("results") or url.endswith("/result"):
                 break
             time.sleep(wait)
-            url = resp.headers.get("Location")
-            if not url:
-                raise RuntimeError("LRO response missing Location header.")
-            url = cast(str, url)
+            backoff_seconds *= 2
+            next_url = resp.headers.get("Location")
+            if next_url:
+                url = cast(str, next_url)
+                continue
+            if status == LongRunningOperationStatus.SUCCEEDED and state_url:
+                url = f"{state_url}/result"
+                continue
+            if state_url:
+                url = state_url
+                continue
+            raise RuntimeError(
+                "LRO response missing Location header and x-ms-operation-id."
+            )
 
         try:
             final_resp = session.get(
@@ -380,7 +427,8 @@ class Client(BaseClient):
         timeout: int = 120,
     ) -> requests.Response:
         fallback_interval = interval or self.DEFAULT_LRO_INTERVAL
-        wait = int(response.headers.get("Retry-After", fallback_interval))
+        backoff_seconds = interval if interval is not None else 2
+        wait = self._get_retry_wait(response.headers, backoff_seconds, fallback_interval)
         url = response.headers.get("Location")
         if not url:
             raise RuntimeError("Job response missing Location header.")
@@ -392,6 +440,7 @@ class Client(BaseClient):
             url=url,
         )
         time.sleep(wait)
+        backoff_seconds *= 2
         while True:
             try:
                 resp = session.get(
@@ -407,7 +456,7 @@ class Client(BaseClient):
                 raise
             if resp.status_code >= 300:
                 return resp
-            wait = int(resp.headers.get("Retry-After", fallback_interval))
+            wait = self._get_retry_wait(resp.headers, backoff_seconds, fallback_interval)
             data = resp.json()
             status = data.get("status")
             if status in {JobStatus.FAILED, JobStatus.DEDUPE}:
@@ -429,6 +478,7 @@ class Client(BaseClient):
                 url=url,
             )
             time.sleep(wait)
+            backoff_seconds *= 2
 
     def _send_request(
         self,
@@ -475,6 +525,7 @@ class Client(BaseClient):
             raise
 
         retries = 0
+        backoff_seconds = 2
         while retries <= max_retries:
             try:
                 code = resp.status_code
@@ -547,9 +598,11 @@ class Client(BaseClient):
                 retries += 1
                 if retries > max_retries:
                     raise e
-                time.sleep(retry_interval)
+                wait = self._get_retry_wait(None, backoff_seconds, retry_interval)
+                time.sleep(wait)
+                backoff_seconds *= 2
                 logger.info(
-                    f"Request failed. Retrying after {retry_interval}s. {retries}/{max_retries}"
+                    f"Request failed. Retrying after {wait}s. {retries}/{max_retries}"
                 )
         return resp
 
@@ -663,9 +716,10 @@ class AsyncClient(BaseClient):
         interval: Optional[int] = None,
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
+        backoff_seconds = interval if interval is not None else 2
         while True:
-            wait = interval or int(
-                response.headers.get("Retry-After", self.DEFAULT_THROTTLE_INTERVAL)
+            wait = self._get_retry_wait(
+                response.headers, backoff_seconds, self.DEFAULT_THROTTLE_INTERVAL
             )
             try:
                 err_payload = await response.json()
@@ -677,6 +731,7 @@ class AsyncClient(BaseClient):
                 retry_in=wait,
             )
             await asyncio.sleep(wait)
+            backoff_seconds *= 2
             req = response.request_info
             if req is None or req.method is None or req.url is None:
                 raise RuntimeError("Response request metadata missing for retry.")
@@ -750,8 +805,11 @@ class AsyncClient(BaseClient):
         req = response.request_info
         body = await response.read()
         resp: Optional[aiohttp.ClientResponse] = None
+        backoff_seconds = 2
         for attempt in range(1, max_retries + 1):
-            await asyncio.sleep(retry_interval)
+            wait = self._get_retry_wait(None, backoff_seconds, retry_interval)
+            await asyncio.sleep(wait)
+            backoff_seconds *= 2
             try:
                 async with asyncio.timeout(timeout):
                     async with session.request(
@@ -773,7 +831,7 @@ class AsyncClient(BaseClient):
                         self._error_response_handler(
                             payload,
                             context="item_name_in_use",
-                            retry_after=retry_interval,
+                            retry_after=wait,
                             attempt=attempt,
                             max_retries=max_retries,
                         )
@@ -796,15 +854,24 @@ class AsyncClient(BaseClient):
         interval: Optional[int] = None,
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
-        wait = interval or int(
-            response.headers.get("Retry-After", self.DEFAULT_LRO_INTERVAL)
-        )
+        backoff_seconds = interval if interval is not None else 2
+        wait = self._get_retry_wait(response.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL)
+        operation_id = response.headers.get("x-ms-operation-id")
+        state_url = None
         url = response.headers.get("Location")
+        if not url and operation_id:
+            state_url = f"{ENDPOINT}/operations/{operation_id}"
+            url = state_url
         if not url:
-            raise RuntimeError("LRO response missing Location header.")
+            raise RuntimeError(
+                "LRO response missing Location header and x-ms-operation-id."
+            )
         url = cast(str, url)
+        if operation_id and not state_url:
+            state_url = f"{ENDPOINT}/operations/{operation_id}"
         logger.info(f"Long Running Operation started, checking in {wait}s at {url}")
         await asyncio.sleep(wait)
+        backoff_seconds *= 2
 
         session = await self._get_or_create_session()
 
@@ -831,6 +898,9 @@ class AsyncClient(BaseClient):
                             )
                             raise LongRunningOperationError(500, msg, error)
 
+                        wait = self._get_retry_wait(
+                            resp.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL
+                        )
                         log_event(
                             logger,
                             "lro_status",
@@ -838,14 +908,26 @@ class AsyncClient(BaseClient):
                             percent_complete=data.get("percentComplete"),
                         )
 
-                        if current_url.endswith("results"):
+                        if current_url.endswith("results") or current_url.endswith(
+                            "/result"
+                        ):
                             break
 
                         await asyncio.sleep(wait)
-                        url = resp.headers.get("Location")
-                        if not url:
-                            raise RuntimeError("LRO response missing Location header.")
-                        url = cast(str, url)
+                        backoff_seconds *= 2
+                        next_url = resp.headers.get("Location")
+                        if next_url:
+                            url = cast(str, next_url)
+                            continue
+                        if status == LongRunningOperationStatus.SUCCEEDED and state_url:
+                            url = f"{state_url}/result"
+                            continue
+                        if state_url:
+                            url = state_url
+                            continue
+                        raise RuntimeError(
+                            "LRO response missing Location header and x-ms-operation-id."
+                        )
             except asyncio.TimeoutError:
                 log_event(
                     logger,
@@ -875,7 +957,8 @@ class AsyncClient(BaseClient):
         timeout: int = 120,
     ) -> aiohttp.ClientResponse:
         fallback_interval = interval or self.DEFAULT_LRO_INTERVAL
-        wait = int(response.headers.get("Retry-After", fallback_interval))
+        backoff_seconds = interval if interval is not None else 2
+        wait = self._get_retry_wait(response.headers, backoff_seconds, fallback_interval)
         url = response.headers.get("Location")
         if not url:
             raise RuntimeError("Job response missing Location header.")
@@ -887,12 +970,16 @@ class AsyncClient(BaseClient):
             url=url,
         )
         await asyncio.sleep(wait)
+        backoff_seconds *= 2
         while True:
             try:
                 async with asyncio.timeout(timeout):
                     resp = await session.get(url, headers=self.get_headers(headers))
                     if resp.status >= 300:
                         return resp
+                    wait = self._get_retry_wait(
+                        resp.headers, backoff_seconds, fallback_interval
+                    )
                     data = await resp.json()
                     status = data.get("status")
                     if status in {JobStatus.FAILED, JobStatus.DEDUPE}:
@@ -917,6 +1004,7 @@ class AsyncClient(BaseClient):
                         url=url,
                     )
                     await asyncio.sleep(wait)
+                    backoff_seconds *= 2
             except asyncio.TimeoutError:
                 log_event(
                     logger,
@@ -952,6 +1040,7 @@ class AsyncClient(BaseClient):
         merged_headers: Dict[str, str] = headers or {}
         resp: Optional[aiohttp.ClientResponse] = None
         retries = 0
+        backoff_seconds = 2
         while retries <= max_retries:
             try:
                 try:
@@ -1042,9 +1131,11 @@ class AsyncClient(BaseClient):
                 retries += 1
                 if retries > max_retries:
                     raise e
-                await asyncio.sleep(retry_interval)
+                wait = self._get_retry_wait(None, backoff_seconds, retry_interval)
+                await asyncio.sleep(wait)
+                backoff_seconds *= 2
                 logger.info(
-                    f"Request failed. Retrying after {retry_interval}s. {retries}/{max_retries}"
+                    f"Request failed. Retrying after {wait}s. {retries}/{max_retries}"
                 )
         if resp is None:
             raise RuntimeError("No response received.")
