@@ -375,6 +375,23 @@ class Client(BaseClient):
                     url=url,
                 )
                 raise LongRunningOperationError(500, msg, error)
+            if status == LongRunningOperationStatus.SUCCEEDED:
+                next_url = resp.headers.get("Location")
+                if next_url:
+                    url = cast(str, next_url)
+                elif state_url:
+                    url = f"{state_url}/result"
+                elif not (url.endswith("/result") or url.endswith("results")):
+                    url = f"{url}/result"
+                log_event(
+                    logger,
+                    "lro_status",
+                    status=status,
+                    percent_complete=data.get("percentComplete"),
+                    wait=0,
+                    url=url,
+                )
+                break
             wait = self._get_retry_wait(
                 resp.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL
             )
@@ -386,15 +403,6 @@ class Client(BaseClient):
                 wait=wait,
                 url=url,
             )
-            if status == LongRunningOperationStatus.SUCCEEDED:
-                next_url = resp.headers.get("Location")
-                if next_url:
-                    url = cast(str, next_url)
-                elif state_url:
-                    url = f"{state_url}/result"
-                elif not (url.endswith("/result") or url.endswith("results")):
-                    url = f"{url}/result"
-                break
             if url.endswith("results") or url.endswith("/result"):
                 break
             time.sleep(wait)
@@ -906,17 +914,6 @@ class AsyncClient(BaseClient):
                                 url=url,
                             )
                             raise LongRunningOperationError(500, msg, error)
-
-                        wait = self._get_retry_wait(
-                            resp.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL
-                        )
-                        log_event(
-                            logger,
-                            "lro_status",
-                            status=status,
-                            percent_complete=data.get("percentComplete"),
-                        )
-
                         if status == LongRunningOperationStatus.SUCCEEDED:
                             next_url = resp.headers.get("Location")
                             if next_url:
@@ -928,7 +925,26 @@ class AsyncClient(BaseClient):
                                 or current_url.endswith("results")
                             ):
                                 url = f"{current_url}/result"
+                            log_event(
+                                logger,
+                                "lro_status",
+                                status=status,
+                                percent_complete=data.get("percentComplete"),
+                                wait=0,
+                                url=url,
+                            )
                             break
+                        wait = self._get_retry_wait(
+                            resp.headers, backoff_seconds, self.DEFAULT_LRO_INTERVAL
+                        )
+                        log_event(
+                            logger,
+                            "lro_status",
+                            status=status,
+                            percent_complete=data.get("percentComplete"),
+                            wait=wait,
+                            url=url,
+                        )
                         if current_url.endswith("results") or current_url.endswith(
                             "/result"
                         ):
